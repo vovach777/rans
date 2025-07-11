@@ -9,6 +9,7 @@
 #include <numeric>
 #include <execution>
 #include <filesystem>
+#include <utility>
 namespace fs = std::filesystem;
 #include <immintrin.h>
 #include "mio.hpp"
@@ -54,6 +55,16 @@ void simd_reverse(uint8_t* begin, uint8_t* end) {
     std::reverse(begin,end);
 }
 
+template <int N>
+struct Unroller {
+  template <typename T>
+  static void Execute(T&& t) {
+    if constexpr (N > 0) {
+      Unroller<N-1>::Execute(t);
+      t(N-1);
+    }
+  }
+};
 
 using myargs::args;
 int main(int argc, char** argv) {
@@ -86,7 +97,11 @@ try {
     }
 
     auto is_benchmark = args.has('b') || args.has("benchmark");
-
+    constexpr uint32_t prob_bits = 14;
+    constexpr int Parallel_log2 = 2;
+    constexpr int Parallel = 1 << Parallel_log2; //interleaved
+    std::cout << "Running in interleaved " << Parallel << "x, " << prob_bits << " bits." <<  std::endl;
+    constexpr int Parallel_mask = Parallel - 1;
     constexpr int64_t PgSize = 4 << 20;
     createEmptyFile(filename.data());
     extendFile(filename.data(),PgSize);
@@ -133,8 +148,6 @@ try {
             print_progress();
         }
     };
-    constexpr uint32_t prob_bits = 12;
-
     if (is_decoder) {
     // ----- Декодер rANS с alias-таблицей -----
 
@@ -147,38 +160,44 @@ try {
         stats.load_freqs(reinterpret_cast<const uint16_t*>(src), reinterpret_cast<const uint16_t*>(src)+256);
         src += 256 * 2;
         stats.make_alias_table();
-
         // Инициализируем декодер
-        rANS::State<prob_bits> state;
         auto getbyte = [&]() -> uint8_t {
             if (src == src_end) {
                 throw std::logic_error("EOF");
             }
             return *src++;
         };
-        state.RansDecInit(getbyte);
+        rANS::State<prob_bits> state[Parallel];
+        Unroller<Parallel>::Execute(
+            [&](int j) {
+                state[j].RansDecInit(getbyte);
+            });
+
         cherry_pick_sw.start();
-        for (size_t i = 0; i < in_bytes; i++) {
-            uint8_t sym = state.RansDecGetAlias(stats);
-            if (dest == dest_end) {
-                cherry_pick_sw.stop();
-                //размер выходного файла известен заранее, поэтому расширяем его только на PgSize байт
-                if (in_bytes-i <= PgSize) {
-                    check_expand(in_bytes-i, 0, 1);
-                } else {
-                    check_expand(1, 0, PgSize);
-                }
-                cherry_pick_sw.start();
-            }
-            *dest++ = sym;
-            state.RansDecRenorm(getbyte);
+        int64_t i = 0;
+        for (; i+Parallel <= in_bytes; i+=Parallel, dest+=Parallel) {
+            check_expand(Parallel, 0, PgSize);
+            Unroller<Parallel>::Execute([&](int j) {
+                dest[j] = state[j].RansDecGetAlias(stats);
+            });
+            Unroller<Parallel>::Execute([&](int j) {
+                state[j].RansDecRenorm(getbyte);
+            });
         }
+        // Process remainder
+        for (int j=0; i < in_bytes; ++i, ++j) {
+            check_expand(1, 0, Parallel);
+            assert(j < Parallel);
+            *dest++ = static_cast<uint8_t>( state[j].RansDecGetAlias(stats) );
+            state[j].RansDecRenorm(getbyte);
+        }
+
         cherry_pick_sw.stop();
     } else {
         static_assert(prob_bits <= 16, "prob_bits must be <= 16");
         static_assert(prob_bits >= 8, "prob_bits must be >= 8");
         rANS::SymbolStats<prob_bits,8> stats;
-        rANS::State<prob_bits> state;
+        rANS::State<prob_bits> state[Parallel];
         stats.count_freqs(src, src_end);
         stats.normalize_freqs();
         stats.make_alias_table();
@@ -204,12 +223,29 @@ try {
             }
             *dest++ = byte;
         };
-        auto last = src_end;
+        src = src_end;
         cherry_pick_sw.start();
-        for (src = src_end; src != src_begin;) {
-            state.RansEncPutAlias(putbyte, stats, *--src);
+        auto i = src_size;
+
+        while (i & Parallel_mask) {
+            --i;
+            state[i & Parallel_mask].RansEncPutAlias(putbyte, stats, *--src);
         }
-        state.RansEncFlush(putbyte);
+        // Main loop processing multiple bytes at a time
+        for (; i > 0; i -= Parallel) { // NB: working in reverse!
+
+            Unroller<Parallel>::Execute(
+                [&](int j)  {
+                    j += 1;
+                    state[Parallel - j].RansEncPutAlias(putbyte, stats, src[-j]);
+                });
+            src -= Parallel;
+        }
+        Unroller<Parallel>::Execute(
+            [&](int j)  {
+                state[Parallel - 1 - j].RansEncFlush(putbyte);
+            });
+
         cherry_pick_sw.stop();
 
     }
